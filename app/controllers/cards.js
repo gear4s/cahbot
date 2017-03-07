@@ -1,7 +1,7 @@
-var _ = require('underscore'),
+var    _ = require('lodash'),
     Card = require('../models/card');
 
-var Cards = function Cards(cards) {
+var Cards = function Cards(cards, type) {
     var self = this;
 
     self.cards = [];
@@ -9,13 +9,12 @@ var Cards = function Cards(cards) {
     // add all cards in init array
     _.each(cards, function (c) {
         var card;
-        if(c instanceof Card) {
+        if (c instanceof Card)
             card = c;
-        } else if(c.hasOwnProperty('value')) {
-            card = new Card(c);
-        } else {
-            console.warning('Invalid card', c);
-        }
+        else if (c.hasOwnProperty('text'))
+            card = new Card(c, type);
+        else
+            console.warn('Invalid card', c);
         self.cards.push(card);
     });
 
@@ -25,9 +24,8 @@ var Cards = function Cards(cards) {
      * @returns {Array} Array of the old, replaced cards
      */
     self.reset = function(cards) {
-        if(typeof cards === 'undefined') {
+        if (typeof cards === 'undefined')
             cards = [];
-        }
         var oldCards = self.cards;
         self.cards = cards;
         return oldCards;
@@ -75,25 +73,27 @@ var Cards = function Cards(cards) {
             // get multiple cards
             var pickedCards = new Cards();
             // first get all cards
-            _.each(index, function (i) {
+            _.each(index, _.bind(function (i) {
                 var c = self.cards[i];
                 if (typeof c === 'undefined') {
                     throw new Error('Invalid card index');
                 }
 //                cards.push();
                 pickedCards.addCard(c);
-            }, this);
+            }, this));
             // then remove them
             self.cards = _.without.apply(this, _.union([self.cards], pickedCards.cards));
 //            _.each(pickedCards, function(card) {
 //                self.cards.removeCard(card);
 //            }, this);
+/*
             console.log('picked cards:');
-            console.log(_.pluck(pickedCards.cards, 'id'));
-            console.log(_.pluck(pickedCards.cards, 'value'));
+            console.log(_.map(pickedCards.cards, 'id'));
+            console.log(_.map(pickedCards.cards, 'value'));
             console.log('remaining cards:');
-            console.log(_.pluck(self.cards, 'id'));
-            console.log(_.pluck(self.cards, 'value'));
+            console.log(_.map(self.cards, 'id'));
+            console.log(_.map(self.cards, 'value'));
+*/
             return pickedCards;
         } else {
             var card = self.cards[index];

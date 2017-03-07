@@ -1,0 +1,323 @@
+[
+	{
+		"commands": ["start", "go"],
+		"info":     "Start a game with # points to win and selected decks (see %%decks).",
+		"handler":  "start",
+		"public":   true,
+		"params":   [
+			{
+				"name":     "points",
+				"type":     "number",
+				"required": false,
+				"multiple": false
+			},
+			{
+				"name":     "~deckGroup",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			},
+			{
+				"name":     "+deck",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			},
+			{
+				"name":     "-deck",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			}
+		]
+	},
+	{
+		"commands": ["vstart"],
+		"info":     "Start a game with voting enabled (no Card Czar).",
+		"handler":  "vstart",
+		"public":   true,
+		"params":   [
+			{
+				"name":     "points",
+				"type":     "number",
+				"required": false,
+				"multiple": false
+			},
+			{
+				"name":     "~deckGroup",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			},
+			{
+				"name":     "+deck",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			},
+			{
+				"name":     "-deck",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			}
+		]
+	},
+	{
+		"commands": ["cstart"],
+		"info":     "Start a game with Card Czar enabled.",
+		"handler":  "cstart",
+		"public":   true,
+		"params":   [
+			{
+				"name":     "points",
+				"type":     "number",
+				"required": false,
+				"multiple": false
+			},
+			{
+				"name":     "~deckGroup",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			},
+			{
+				"name":     "+deck",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			},
+			{
+				"name":     "-deck",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			}
+		]
+	},
+	{
+		"commands": ["stop"],
+		"info":     "Stop the current game",
+		"flag":     "o",
+		"handler":  "stop",
+		"public":   true
+	},
+	{
+		"commands": ["join", "j"],
+		"info":     "Join the current game or start a new one",
+		"handler":  "join",
+		"public":   true
+	},
+	{
+		"commands": ["quit", "q", "leave"],
+		"info":     "(player) Leave the current game",
+		"handler":  "quit",
+		"public":   true
+	},
+	{
+		"commands": ["remove", "r"],
+		"info":     "Remove <player> from the current game",
+		"flag":     "o",
+		"handler":  "remove",
+		"params":   [
+			{
+				"name":     "player",
+				"type":     "string",
+				"required": true,
+				"multiple": false
+			}
+		]
+	},
+	{
+		"commands": ["cards", "c"],
+		"info":     "(player) Show your current cards",
+		"handler":  "cards"
+	},
+	{
+		"commands": ["play"],
+		"info":     "(player) Play your card number #",
+		"handler":  "play",
+		"params":   [
+			{
+				"name":     "card",
+				"type":     "number",
+				"required": true,
+				"multiple": true
+			}
+		]
+	},
+	{
+		"commands": ["list"],
+		"info":     "List the current players",
+		"flag":     "",
+		"handler":  "list",
+		"public":   true
+	},
+	{
+		"commands": ["winner", "w", "vote", "v"],
+		"info":     "Pick the winning entry",
+		"handler":  "winner",
+		"params":   [
+			{
+				"name":     "entry",
+				"type":     "number",
+				"required": true,
+				"multiple": false
+			}
+		]
+	},
+	{
+		"commands": ["points", "scores"],
+		"info":     "Show the current scores for all players",
+		"handler":  "points",
+		"public":   true
+	},
+	{
+		"commands": ["status"],
+		"info":     "Show the current game status",
+		"handler":  "status",
+		"public":   true
+	},
+	{
+		"commands": ["pause"],
+		"info":     "Pause the current game",
+		"flag":     "o",
+		"handler":  "pause",
+		"public":   true
+	},
+	{
+		"commands": ["resume", "unpause"],
+		"info":     "Resume the currently paused game",
+		"flag":     "o",
+		"handler":  "resume",
+		"public":   true
+	},
+	{
+		"commands": ["pick", "p"],
+		"info":     "(player,czar) Play a card or pick a winning entry. (If fastpick is on, you can just type the number(s))",
+		"handler":  "pick",
+		"params":   [
+			{
+				"name":     "card",
+				"type":     "number",
+				"required": true,
+				"multiple": true
+			}
+		]
+	},
+	{
+		"commands": ["coin", "flip"],
+		"info":     "(player,czar) Flip a coin to randomly choose a card or a winning entry between two choices; e.g. '.coin 4 9'",
+		"handler":  "coin",
+		"params":   [
+			{
+				"name":     "heads",
+				"type":     "string",
+				"required": true,
+				"multiple": false
+			},
+			{
+				"name":     "tails",
+				"type":     "string",
+				"required": true,
+				"multiple": false
+			}
+		]
+	},
+	{
+		"commands": ["help"],
+		"info":     "List commands or get help for <command>",
+		"handler":  "help",
+		"params":   [
+			{
+				"name":     "command",
+				"type":     "string",
+				"required": false,
+				"multiple": false
+			}
+		]
+	},
+	{
+		"commands": ["test"],
+		"info":     "Get a test NOTICE from the bot. If you can't see this, you won't be able to see your cards",
+		"handler":  "test"
+	},
+	{
+		"commands": ["beer"],
+		"info":     "Order a beer, or order beers for <nick1, nick2, ...>. Use \"all\" to send beers to all current players",
+		"handler":  "beer",
+		"public":   true,
+		"params":   [
+			{
+				"name":     "nick",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			}
+		]
+	},
+	{
+		"commands": ["decks", "d"],
+		"info":     "List the card decks and deck groups available",
+		"handler":  "decks"
+	},
+	{
+		"commands": ["deckinfo", "di"],
+		"info":     "Get information about a deck by code",
+		"handler":  "deckinfo",
+		"params":   [
+			{
+				"name":     "deck",
+				"type":     "string",
+				"required": false,
+				"multiple": true
+			}
+		]
+	},
+	{
+		"commands": ["groupinfo", "gi"],
+		"info":     "Get information about a deck group by tag",
+		"handler":  "groupinfo",
+		"params":   [
+			{
+				"name":     "tag",
+				"type":     "string",
+				"required": true,
+				"multiple": false
+			}
+		]
+	},
+	{
+		"commands": ["ping"],
+		"info":     "Highlight people who might want to play. Use /away or %%away to remove yourself from this list.",
+		"handler":  "ping",
+		"public":   true
+	},
+	{
+		"commands": ["away"],
+		"info":     "Remove yourself from the ping list (%%help ping). Resets on join unless you use 'forever'. Setting /away in your client also works. (%%back to undo)",
+		"handler":  "away",
+		"params":	[
+			{
+				"name":     "\"forever\"",
+				"type":     "string",
+				"required": false,
+				"multiple": false
+			}
+		]
+	},
+	{
+		"commands": ["back"],
+		"info":     "Add yourself to the ping list (%%help ping) after being away (%%help away)",
+		"handler":  "back"
+	},
+	{
+		"commands":   ["gg"],
+		"hidden":     true,
+		"handler":    "gg",
+		"noPrefix":   true,
+		"noParams":   true,
+		"noThrottle": true,
+		"public":     true
+	}
+]

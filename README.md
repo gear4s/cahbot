@@ -1,105 +1,138 @@
-#Cards Against Humanity IRC bot
+# Cards Against Humanity IRC bot
 
-IRC bot that let's you play [Cards Against Humanity](http://www.cardsagainsthumanity.com/) in IRC. The game is running in IRCnet on #cah, but you can just as easily run your own instance on your own channel for more private games.
+This is a [node.js](https://nodejs.org) bot that lets you play [Cards Against Humanity](http://www.cardsagainsthumanity.com/) over IRC. This version is running on [##humanity @ freenode](https://kiwiirc.com/client/chat.freenode.net/##humanity). It is heavily based on a bot from #cah on IRCnet.
 
-##Commands
-* **!start #** - Start a new game. Optional parameter can by used to set a point limit for the game (e.g. `!start 10` to play until one player has 10 points.)
-* **!stop** - Stop the currently running game.
-* **!pause** - Pause the currently running game.
-* **!resume** - Resume a paused game.
-* **!join** - Join to the currently running game.
-* **!quit** - Quit from the game.
-* **!cards** - Show the cards you have in your hand.
-* **!play # (#)** - Play a card from your hand, # being the number of the card in the list. Play as many numbers separated by spaces as the current card required.
-* **!winner #** - Pick a winner of the round, # being the number of the entry in the list. Only for the current *card czar*.
-* **!points** - Show players' *awesome points* in the current game.
-* **!list** - List players in the current game.
-* **!status** - Show current status of the game. Output depends on the state of the game (e.g. when waiting for players to play, you can check who hasn't played yet)
-* **!pick** - Alias for !play and !winner commands.
+## Install
 
-Some of these commands reply as notice. If you use [Irssi](http://www.irssi.org), you can use [active_notice.pl](http://scripts.irssi.org/scripts/active_notice.pl) to get notices on the active window instead of status window.
-
-##Install
 1. Clone the repository.
-2. Edit configuration files with your channel & server settings.
+2. Copy the configuration file `config.json.example` to `config.json`
+2. Edit configuration file with your channel & server settings.
 3. Install dependencies using `npm install`.
 
-###Requirements
-* Node.js 0.10.*
+##### Requirements
+* Node.js - tested on 4+
 
-##Run
-Run the bot by running `node app.js`, or if you want to run it with production settings instead of development, run `NODE_ENV=production node app.js`.
+## Run
+Run the bot by running `npm start`, in tmux or screen for example.
 
-##Configuration
-Main configuration files are located in `config/env`. There are two files by default for two different environments, development and production (e.g. if you want to test the bot on a separate channel). For the `clientOptions` directive, refer to the [Node-IRC documentation](https://node-irc.readthedocs.org/en/latest/API.html#client).
-
-It is possible to configure the bot to send a message to a user or channel after connecting to server or joining a specific channel using `connectCommands` and `joinCommands`. This can be used, for example, to identify with NickServ on networks that require it. See examples below.
-
-###Cards
-Card configuration is located in `config/cards` directory. Some files are included by default, that contain the default cards of the game plus some extra cards from [BoardGameGeek](http://boardgamegeek.com/). You can add your custom cards to `Custom_a.json` (for answers) and `Custom_q.json` (for questions), using the same format as the default card files. Any card you add to these files will also be automatically loaded to the game during start up..
-
-###Notify Users
-Users currently in the channel with the bot can be notified when a game begins by setting the `notifyUsers` directive to true. Users with ~ and & modes are not notified.
-
-###Set Topic
-The bot can be configured to set the channel topic indicating whether a game is running or not by setting the `setTopic` directive to true. The `topicBase` directive will be appended to the end of the status information. The bot must have permission in the channel for this to work.
-
-###Point Limit
-You can set a default point limit in the configuration file by settings the `pointLimit` to any positive number. The game stops when a player reaches this point limit. 0 or a negative number means no point limit and games are played until `!stop` command is entered.
-
-Additionally point limit can be set on a per game basis as a parameter for the `!start` command (see *Commands*).
-
-###Connect and join command examples
-
-####NickServer
-To identify with NickServ after connecting, you can use the following ´connectCommands´:
+## SASL and SSL
+If you would rather identify to the server directly instead of msging nickserv, you can use SASL:
 
 ```JavaScript
-"connectCommands": [
-    {
-        "target": "nickserv",
-        "message": "identify <password>"
+    "clientOptions": {
+        ...
+        "sasl": true,               // - Enable SASL?
+        "secure": true,             // - Enable SSL encryption?
+        "selfSigned": true,         // - If SSL, allow unverified server certificates?
+        "port": 6697,               // - The SSL port your server listens on.
+        "userName": "cah",          // - The account name to identify as.
+        "password": "mypassword"    // - The account password.
     }
-]
 ```
 
-####Notify after connecting and joining #awesomechannel
+## Game Commands
+The prefix character '.' is configurable. Settings for specific commands are configurable in `commands.json`
 
-This example will send you a private message when the bot has connected to server and another private message when it has joined #awesomechannel. The bot will also send a message to #awesomechannel saying that it's back and ready to play.
+||Formatting|
+|---|---|
+|`[]`| optional command parameter
+|`<>`| required command parameter
+|`[ ...]`| parameter can be repeated
+|`#`| a number
 
-```JavaScript
-"connectCommands": [
-    {
-        "target": "yournick",
-        "message": "Connected to server."
-    }
-],
-"joinCommands": {
-	"#awesomechannel": [
-		{
-			"target": "#awesomechannel",
-			"message" "I'm back, let's play!"
-		},
-		{
-			"target": "yournick",
-			"message": "I just joined #awesomechannel."
-		}
-	]
-}
+### General Commands
+
+|Command|Parameters|Description|
+|---|---|---|
+| `.help` || List commands.
+| `.test` || Get a test NOTICE from the bot - if you can't see this, you won't be able to see your cards.
+| `.join` `(.j)` | `*` | Join the currently running game or else start a new one, taking the same parameters as `.start`.
+| `.start` | `[#] [~deckGroup ...] [+deck ...] [-deck ...]` | Start a new game with default or specified card decks. **(See [Starting a Game](#starting-a-game))**
+| `.cstart` | `^` | Start a new game in Card Czar mode (standard game).
+| `.vstart` | `^` | Start a new game without a card czar -- all players vote for the winner each round.
+| `.decks` `(.d)` || Show the list of available card decks and the deck group tags that are defined. If used during a game it will list the decks active for that game. **(See [Decks and Groups](#decks-and-groups))**
+| `.deckinfo` `(.di)` | `<code>` | Display information about the deck `code` -- e.g. `.di CAHBS` **(See [Decks and Groups](#decks-and-groups))**
+| `.groupinfo` `(.gi)` | `<tag>` | List the decks and groups collected under `tag` -- e.g. `.gi ~DEFAULT` **(See [Decks and Groups](#decks-and-groups))**
+| `.ping` || Tell the bot to highlight all the available players in the channel.
+| `.away` | `["forever"]` | Make yourself exempt from being `.ping`ed
+| `.beer` | `[nick...]|"all"` | Order a beer for yourself, someone else or all current players.
+| `.points` || Show players' *awesome points* in the current game.
+| `.list` || List players in the current game.
+| `.status` || Show current status of the game. Output depends on the state of the game (e.g. when waiting for players to play, you can check who hasn't played yet).
+
+### Player Commands
+
+|Command|Parameters|Description|
+|---|---|---|
+| `.quit` `(.q)` || Leave the game.
+| `.cards` `(.c)` || Show the cards you have in your hand.
+| `#` | `[#...]` | Pick number `#` -- typing just a number or numbers is exactly the same as using the `.pick` command.
+| `.pick (.p)` | `# [#...]` | Alias for `.play` and `.winner` commands (or `.vote` in no-czar games).
+| `.play` | `# [#...]` | Play a card from your hand, `#` being the number of the card in the list. Play as many numbers separated by spaces as the current card required.
+| `.winner` `(.w)` | `#` | Pick a winner of the round, `#` being the number of the entry in the list. Only for the current *card czar*.
+| `.vote`
+
+### Op Commands
+
+You must be opped in the channel to use these commands (configurable).
+
+|Command|Parameters|Description|
+|---|---|---|
+| `.stop` || Stop the currently running game.
+| `.pause` || Pause the currently running game.
+| `.resume` || Resume a paused game.
+| `.remove` `(.r)` | `<nick>` | Remove a player from the game.
+
+The bot will also act on invites to channels it knows about.
+
+### Starting a Game
+
+The `.start` command provides several options, most importantly allowing you to choose the card decks for your game. You can list the available decks using the `.decks` command at any time while a game is *not* running.
+
+`.start #` -- where `#` is the number of points needed to win.
 ```
-##TODO
-* Save game & player data to MongoDB for all time top scores & other statistics.
-* Config options for rule variations, such as voting the best instead of card czar choosing the winner.
-* The haiku round.
-* Allow players to change one card per round (make it an option in config?)
+  .start 5
+```
 
-##Contribute
-All contributions are welcome in any form, be it pull requests for new features and bug fixes or issue reports or anything else.
+`.start # code` -- load specific card decks by code
+```
+  .start 3 CAHBS
+  .start 5 CAHBS JBYMF FFE2X
+```
+
+`.start # ~group` -- whole deck groups can be referenced by tag. Tags start with a ~ (tilde)
+```
+  .start 7 ~FULL
+  .start 6 ~STANDARD ~REGIONAL
+```
+
+`.start # ... -code` -- start without a specific deck or decks
+```
+  .start 5 ~STANDARD -CAHBS
+  .start 8 ~DEFAULT JBYMF -FFE2X
+```
+
+You can also start a game in Voting or 'Democracy' mode -- there is no Card Czar and the winner in each round is chosen by vote. In this mode, players must send their vote by private message, e.g. `/msg cabbit 4`
+
+### Decks and Groups
+
+All cards are sourced from [Cardcast](https://www.cardcastgame.com) (where you can easily build your own decks). Decks are made available by enabling them in `config.json`. You can also define arbitrary deck group tags. The default decks to be loaded are set by defining the `~DEFAULT` tag.
+
+## Notices in Active Window
+
+Some important game messages are sent by NOTICE.
+To get notices in the active window of your client:
+* [WeeChat](https://weechat.org) -- (assuming server 'freenode'): `/set irc.msgbuffer.freenode.notice current`
+* [Irssi](http://www.irssi.org) -- use [active_notice.pl](http://scripts.irssi.org/scripts/active_notice.pl)
+* [mIRC](http://www.mirc.com) -- Go to Options -> IRC and set ['Show in active'](http://i.imgur.com/5UENoA2.png)
+
+## Contribute
+All contributions are welcome in any form, be it pull requests for new features and bug fixes or issue reports or anything else. Feel free to drop into [##humanity-dev @ freenode](https://kiwiirc.com/client/chat.freenode.net/##humanity-dev)
 
 It is recommended to use the **develop** branch as a starting point for new features.
 
-##Thanks
-Special thanks to everyone on the ***super awesome secret IRC channel*** that have helped me test this and given feedback during development.
+## Thanks
+Thanks to @teeli for the original bot and to everyone who has contributed feedback and suggestions.
 
-##License
+## License
 Cards Against Humanity IRC bot and its source code is licensed under a [Creative Commons BY-NC-SA 2.0 license](http://creativecommons.org/licenses/by-nc-sa/2.0/).

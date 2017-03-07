@@ -1,8 +1,15 @@
-var util = require('util'),
-    c = require('irc-colors'),
-    _ = require('underscore'),
-    Cards = require('../controllers/cards'),
-    Card = require('../models/card');
+var      util = require('util'),
+            c = require('irc-colors'),
+            _ = require('lodash'),
+       moment = require('moment'),
+    utilities = require('../utilities'),
+        Decks = require('../controllers/decks'),
+        Cards = require('../controllers/cards'),
+         Card = require('../models/card');
+
+                require('moment-duration-format');
+
+var p; // default prefix char from config
 
 /**
  * Available states for game
@@ -10,7 +17,6 @@ var util = require('util'),
  */
 var STATES = {
     STOPPED:   'Stopped',
-    STARTED:   'Started',
     PLAYABLE:  'Playable',
     PLAYED:    'Played',
     ROUND_END: 'RoundEnd',
@@ -20,97 +26,187 @@ var STATES = {
 
 // TODO: Implement the ceremonial haiku round that ends the game
 var HAIKU = new Card({
-    "draw": 2,
-    "pick": 3,
-    "value": "(Draw 2, Pick 3) Make a haiku."
-});
+    "id": 1234567,
+    "numResponses": 3,
+    "text": "(Draw 2, Pick 3) Make a haiku.",
+    "displayText": "(Draw 2, Pick 3) Make a haiku."
+}, 'q');
 
 /**
  * A single game object that handles all operations in a game
- * @param channel The channel the game is running on
- * @param client The IRC client object
- * @param config Configuration variables
- * @param cmdArgs !start command arguments
+ * @param {Object}    bot                - The main Bot object
+ * @param {Object}   [options]           - Game initialisation options: points, decks, init
+ * @param {number}   [options.points]    - The number of points needed to win
+ * @param {string[]} [options.decks]     - The codes of card decks to load: ['CODE1', 'CODE2', ...]
+ * @param {boolean}  [options.init=true] - Whether to initialise the game immediately
  * @constructor
  */
-var Game = function Game(channel, client, config, cmdArgs) {
-    var self = this;
+var Game = function Game(bot, options) {
+    var    self = this,
+      decksTool = new Decks(bot),
+        channel = bot.channel,
+         client = bot.client,
+         config = bot.config;
+
+    options = options || {};
+    if (options.init === undefined)
+        options.init = true; // pass false for testing
 
     // properties
-    self.waitCount = 0; // number of times waited until enough players
+    self.loaded = false; // did init() complete successfully
+    self.noCzar = options.noCzar || false; // is this a voting game (without czar)
+    self.decks = {};
+    self.deckCodes = [];
     self.round = 0; // round number
     self.players = []; // list of players
+    self.removed = []; // people who are not allowed to join
+    self.left = []; // people who left the game and might rejoin
     self.channel = channel; // the channel this game is running on
     self.client = client; // reference to the irc client
     self.config = config; // configuration data
-    self.state = STATES.STARTED; // game state storage
+    self.STATES = STATES;
+    self.state = STATES.WAITING; // game state storage
+    self.timers = {}; // game timers
+    self.listeners = []; // irc client event listeners
     self.pauseState = []; // pause state storage
     self.points = [];
-    self.notifyUsersPending = false;
-    self.pointLimit = 0; // point limit for the game, defaults to 0 (== no limit)
+    self.pointLimit = options.points || 0; // point limit for the game, defaults to 0 (== no limit)
+    self.winner = {}; // store the winner of the current round
+    self.lastWinner = {}; // store the streak count of the last winner
+    self.lastJoinRound = 0; // store the last round number in which a player joined
+    self.coolOff = false;
+    p = config.commandPrefixChars[0]; // default prefix char
 
-    console.log('Loaded', config.cards.length, 'cards:');
-    var questions = _.filter(config.cards, function(card) {
-        return card.type.toLowerCase() === 'question';
-    });
-    console.log(questions.length, 'questions');
-    var answers = _.filter(config.cards, function(card) {
-        return card.type.toLowerCase() === 'answer';
-    });
-    console.log(answers.length, 'answers');
+    self.init = function() {
+        self.startTime = new Date();
+        if (!self.initCards())
+            return false;
+        self.toggleListeners([
+            ['joinsync' + channel, self.channelRejoinHandler   ],
+            ['selfpart' + channel, self.channelLeaveHandler    ],
+            ['selfkick' + channel, self.channelLeaveHandler    ],
+            [    'quit' + channel, self.playerQuitHandler      ],
+            [    'kill' + channel, self.playerQuitHandler      ],
+            [    'part' + channel, self.playerPartHandler      ],
+            [    'kick' + channel, self.playerKickHandler      ],
+            [    'nick' + channel, self.playerNickChangeHandler]
+        ]);
+        self.setTopic(config.topic.messages.on);
+        self.announce();
+        self.nextRound();
+        self.loaded = true;
+        return true;
+    };
 
-    // init decks
-    self.decks = {
-        question: new Cards(questions),
-        answer: new Cards(answers)
+    self.compileDecksList = function(args) {
+        var decks = [];
+        var failDecks = [];
+        var removeDecks = [];
+        var origArgs = args.slice();
+        args = utilities.arrayToUpperCase(args);
+        _.every(args, function(arg) {
+            if (arg[0] === '~') {
+                var groupData = decksTool.getDecksFromGroup(arg);
+                if (groupData.length)
+                    decks = decks.concat(groupData);
+                else
+                    failDecks.push(arg);
+                args = _.without(args, arg);
+                return true;
+            }
+            return false;
+        });
+        if (args.length) {
+            _.every(args, function(arg) {
+                if (arg[0] === '+' || arg.match(/^\w{5}$/)) {
+                    arg = _.trimStart(arg, '+');
+                    if (_.includes(config.decks, arg)) {
+                        decks.push(arg);
+                    }
+                    else
+                        failDecks.push(arg);
+                    args = _.without(args, '+' + arg);
+                    return true;
+                }
+                return false;
+            });
+        }
+        if (args.length) {
+            _.every(args, function(arg) {
+                if (arg[0] === '-') {
+                    arg = _.trimStart(arg, '-');
+                    if (_.includes(config.decks, arg)) {
+                        removeDecks.push(arg);
+                    }
+                    else
+                        failDecks.push(arg);
+                    args = _.without(args, '-' + arg);
+                    return true;
+                }
+                return false;
+            });
+            failDecks.push.apply(this, args);
+        }
+        if (failDecks.length)
+            self.say(util.format('Could not recognise: %s', failDecks.join(', ')));
+        decks = _.difference(decks, removeDecks);
+        return decks;
     };
-    // init discard piles
-    self.discards = {
-        question: new Cards(),
-        answer: new Cards()
-    };
-    // init table slots
-    self.table = {
-        question: null,
-        answer: []
-    };
-    // shuffle decks
-    self.decks.question.shuffle();
-    self.decks.answer.shuffle();
 
-    // parse point limit from configuration file
-    if(typeof config.pointLimit !== 'undefined' && !isNaN(config.pointLimit)) {
-        console.log('Set game point limit to ' + config.pointLimit + ' from config');
-        self.pointLimit = parseInt(config.pointLimit);
-    }
-    // parse point limit from command arguments
-    if(typeof cmdArgs[0] !==  'undefined' && !isNaN(cmdArgs[0])) {
-        console.log('Set game point limit to ' + cmdArgs[0] + ' from arguments');
-        self.pointLimit = parseInt(cmdArgs[0]);
-    }
+    self.initCards = function() {
+        var defaultDecks = self.compileDecksList(['~default']);
+        if (self.isChristmas())
+            defaultDecks = defaultDecks.concat(self.compileDecksList(['~christmas']));
+
+        decks = (options.decks && options.decks.length) ? self.compileDecksList(options.decks) : defaultDecks;
+
+        var loadDecks = _.filter(bot.decks, function(loadDeck) {
+            return _.includes(decks, loadDeck.code);
+        });
+        var questions = Array.prototype.concat.apply([], _.map(loadDecks, 'calls'));
+        var answers   = Array.prototype.concat.apply([], _.map(loadDecks, 'responses'));
+        self.deckCodes = Array.prototype.concat.apply([], _.map(loadDecks, 'code'));
+
+        if (!questions.length || !answers.length) {
+            self.say('No decks loaded. Stopping...');
+            self.stop();
+            return false;
+        }
+
+        // init decks
+        self.decks = {
+            question: new Cards(questions, 'q'),
+            answer:   new Cards(answers, 'a')
+        };
+
+        // init discard piles
+        self.discards = {
+            question: new Cards(),
+            answer:   new Cards()
+        };
+        // init table slots
+        self.table = {
+            question: null,
+            answer: []
+        };
+        // shuffle decks
+        self.decks.question.shuffle();
+        self.decks.answer.shuffle();
+
+        bot.log(util.format('Loaded %d decks (%s): %d questions, %d answers',
+            loadDecks.length,
+            _.map(loadDecks, 'code').join(', '),
+            questions.length,
+            answers.length
+        ));
+        self.say(util.format('Loaded %d decks: %d questions, %d answers', loadDecks.length, questions.length, answers.length));
+        return true;
+    };
 
     /**
-     * Stop game
+     * Trash game object
      */
-    self.stop = function (player, pointLimitReached) {
-        self.state = STATES.STOPPED;
-
-        if (typeof player !== 'undefined' && player !== null) {
-            self.say(player.nick + ' stopped the game.');
-        } else if (pointLimitReached !== true) {
-            self.say('Game has been stopped.');
-        }
-        if(self.round > 1) {
-            // show points if played more than one round
-            self.showPoints();
-        }
-
-        // clear all timers
-        clearTimeout(self.startTimeout);
-        clearTimeout(self.stopTimeout);
-        clearTimeout(self.turnTimer);
-        clearTimeout(self.winnerTimer);
-
+    self.destroy = function() {
         // Destroy game properties
         delete self.players;
         delete self.config;
@@ -120,9 +216,57 @@ var Game = function Game(channel, client, config, cmdArgs) {
         delete self.decks;
         delete self.discards;
         delete self.table;
+    };
 
-        // set topic
-        self.setTopic(c.bold.yellow('No game is running. Type !start to begin one!'));
+    /**
+     * Stop game
+     */
+    self.stop = function (player, pointLimitReached) {
+        _.each(self.timers.round, function(timer) {
+            clearTimeout(timer);
+        });
+        _.each(self.timers, function(timer) {
+            clearTimeout(timer);
+        });
+        self.toggleListeners();
+        self.state = STATES.STOPPED;
+
+        if (player)
+            self.say(util.format('%s stopped the game.', player.nick));
+        else if (pointLimitReached !== true) {
+            self.say('Game has been stopped.');
+            self.setTopic(config.topic.messages.off);
+        }
+        if (self.round > 1) {
+            var duration = moment.duration( moment().diff(moment(self.startTime)) )
+                                 .format('d [days] h [hours] m [minutes]');
+            self.say(util.format('Game lasted %s', duration));
+            self.showPoints();
+        }
+
+        if (self.config.voicePlayers === true)
+            client.setChanMode(channel, '-v', self.getPlayerNicks());
+
+        bot.game = undefined;
+        setTimeout(self.destroy, 2000);
+    };
+
+    /**
+     * Is the game paused?
+     */
+    self.isPaused = function() {
+        return ( self.STATES.PAUSED === self.state );
+    };
+
+    /**
+     * Can the game be paused?
+     */
+    self.isRunning = function() {
+        return _.includes([
+                    self.STATES.PLAYABLE,
+                    self.STATES.PLAYED,
+                    self.STATES.ROUND_END
+                ], self.state);
     };
 
     /**
@@ -130,15 +274,13 @@ var Game = function Game(channel, client, config, cmdArgs) {
      */
     self.pause = function () {
         // check if game is already paused
-        if (self.state === STATES.PAUSED) {
-            self.say('Game is already paused. Type !resume to begin playing again.');
-            return false;
+        if (self.isPaused()) {
+            return util.format('Game is already paused. Type %sresume to begin playing again.', p);
         }
 
         // only allow pause if game is in PLAYABLE or PLAYED state
-        if (self.state !== STATES.PLAYABLE && self.state !== STATES.PLAYED) {
-            self.say('The game cannot be paused right now.');
-            return false;
+        if (!self.isRunning()) {
+            return 'The game cannot be paused right now.';
         }
 
         // store state and pause game
@@ -147,21 +289,19 @@ var Game = function Game(channel, client, config, cmdArgs) {
         self.pauseState.elapsed = now.getTime() - self.roundStarted.getTime();
         self.state = STATES.PAUSED;
 
-        self.say('Game is now paused. Type !resume to begin playing again.');
+        self.say(util.format('Game is now paused. Type %sresume to begin playing again.', p));
 
-        // clear turn timers
-        clearTimeout(self.turnTimer);
-        clearTimeout(self.winnerTimer);
+        self.stopRoundTimers();
+
+        return '';
     };
 
     /**
      * Resume game
      */
     self.resume = function () {
-        // make sure game is paused
-        if (self.state !== STATES.PAUSED) {
-            self.say('The game is not paused.');
-            return false;
+        if (!self.isPaused()) {
+            return 'The game is not paused.';
         }
 
         // resume game
@@ -173,87 +313,165 @@ var Game = function Game(channel, client, config, cmdArgs) {
 
         self.say('Game has been resumed.');
 
-        // resume timers
-        if (self.state === STATES.PLAYED) {
-            // check if czar quit during pause
-            if(self.players.indexOf(self.czar) < 0) {
-                // no czar
-                self.say('The czar quit the game during pause. I will pick the winner on this round.');
-                // select winner
-                self.selectWinner(Math.round(Math.random() * (self.table.answer.length - 1)));
-            } else {
-                self.winnerTimer = setInterval(self.winnerTimerCheck, 10 * 1000);
-            }
-        } else if (self.state === STATES.PLAYABLE) {
-            self.turnTimer = setInterval(self.turnTimerCheck, 10 * 1000);
+        if (self.state === STATES.PLAYED && !self.noCzar && !_.includes(self.players, self.czar)) {
+            self.say('The Card Czar quit the game during pause. I will pick the winner on this round.');
+            self.selectWinner(Math.round(Math.random() * (self.table.answer.length - 1)));
         }
+        else
+            self.startRoundTimers(self.pauseState.elapsed);
     };
 
     /**
      * Start next round
      */
     self.nextRound = function () {
-        clearTimeout(self.stopTimeout);
-        // check if any player reached the point limit
-        if(self.pointLimit > 0) {
-            var winner = _.findWhere(self.players, {points: self.pointLimit});
-            if(winner) {
-                self.say(winner.nick + ' has the limit of ' + self.pointLimit + ' awesome points and is the winner of the game! Congratulations!');
-                self.stop(null, true);
-                return false;
-            }
+        clearTimeout(self.timers.stop);
+
+        if ( self.endGame() || self.needPlayers() )
+            return false;
+
+        if (self.round === 0) {
+            self.players = _.shuffle(self.players);
+            self.say(util.format('Starting in %s seconds. %s get ready!', config.timeBetweenRounds, self.getPlayerNicks().join(', ')));
+            self.announceWinMode();
+        }
+        self.showPoints((self.round === 0) ? 'start' : 'round');
+        self.state = STATES.PAUSED;
+        self.timers.next = setTimeout(self.startNextRound, config.timeBetweenRounds * 1000);
+    };
+
+    /**
+     * Start next round
+     */
+    self.startNextRound = function () {
+        if (!self.isPaused())
+            return false;
+
+        if (self.round === 0)
+            self.startTime = new Date();
+
+        self.round++;
+
+        if (self.needPlayers())
+            return false;
+
+        var roundNotice = util.format('Round %s!', c.bold(self.round));
+        if (!self.noCzar) {
+            self.setCzar();
+            roundNotice += util.format (' %s is the Card Czar.', self.czar.nick);
         }
 
-        // check that there's enough players in the game
-        if (self.players.length < 3) {
-            self.say('Not enough players to start a round (need at least 3). Waiting for others to join. Stopping in 3 minutes if not enough players.');
-            self.state = STATES.WAITING;
-            // stop game if not enough pleyers in 3 minutes
-            self.stopTimeout = setTimeout(self.stop, 3 * 60 * 1000);
-            return false;
-        }
-        self.round++;
-        console.log('Starting round ', self.round);
-        self.setCzar();
+        self.winner = {};
+        self.say(roundNotice);
         self.deal();
-        self.say('Round ' + self.round + '! ' + self.czar.nick + ' is the card czar.');
         self.playQuestion();
         // show cards for all players (except czar)
         _.each(self.players, function (player) {
-            if (player.isCzar !== true) {
+            if (player.isCzar !== true)
                 self.showCards(player);
-            }
         });
-        self.state = STATES.PLAYABLE;
+    };
+
+    /**
+     * End game
+     */
+    self.endGame = function() {
+        // check if any player reached the point limit
+        if (self.pointLimit <= 0)
+            return false;
+
+        var winner = _.find(self.players, {points: self.pointLimit});
+        if (!winner)
+            return false;
+
+        self.say(util.format('%s has reached %s awesome points and is the winner of the game! %s',
+            c.bold(winner.nick), c.bold(self.pointLimit), c.bold('Congratulations!')));
+
+        self.stop(null, true);
+
+        // Add the winner to the channel topic if message is set
+        self.setTopic(config.topic.messages.winner, {nick: winner.nick});
+        return true;
+    };
+
+    /**
+     * Wait for more players
+     */
+    self.needPlayers = function(silent) {
+        // check that there's enough players in the game
+
+        minPlayers = (self.round === 0) ? config.minPlayers : 3;
+
+        var needed = minPlayers - self.players.length;
+        if (needed <= 0)
+            return 0;
+
+        if (silent)
+            return needed;
+
+        // stop game if not enough players
+        clearTimeout(self.timers.stop);
+        self.timers.stop = setTimeout(self.stop, config.timeWaitForPlayers * 1000);
+        if (self.round !== 0) {
+            self.say(util.format('Need %s more player%s', needed, (needed == 1 ? '' : 's')));
+            self.showPoints('round');
+            self.state = STATES.WAITING;
+        }
+        return needed;
     };
 
     /**
      * Set a new czar
      * @returns Player The player object who is the new czar
      */
-    self.setCzar = function () {
-        if (self.czar) {
-            console.log('Old czar:', self.czar.nick);
-        }
-        self.czar = self.players[self.players.indexOf(self.czar) + 1] || self.players[0];
-        console.log('New czar:', self.czar.nick);
+    self.setCzar = function (newCzar) {
+        if (newCzar)
+            self.say(util.format('%s is the new Card Czar.', newCzar.nick));
+        else
+            newCzar = self.players[self.players.indexOf(self.czar) + 1] || self.players[0];
+
+        self.czar = newCzar;
         self.czar.isCzar = true;
         return self.czar;
+    };
+
+    /**
+     * Deal a card to a player
+     */
+    self.dealCard = function (player) {
+        self.checkDecks();
+        if (self.decks.answer.cards.length === 0) {
+            self.say('Not enough cards to deal. Stopping...');
+            self.stop();
+            return false;
+        }
+        var card = self.decks.answer.pickCards();
+        player.cards.addCard(card);
+        card.owner = player;
     };
 
     /**
      * Deal cards to fill players' hands
      */
     self.deal = function () {
-        _.each(self.players, function (player) {
-            console.log(player.nick + '(' + player.hostname + ') has ' + player.cards.numCards() + ' cards. Dealing ' + (10 - player.cards.numCards()) + ' cards');
+        _.each(self.players, _.bind(function (player) {
             for (var i = player.cards.numCards(); i < 10; i++) {
-                self.checkDecks();
-                var card = self.decks.answer.pickCards();
-                player.cards.addCard(card);
-                card.owner = player;
+                self.dealCard(player);
             }
-        }, this);
+        }, this));
+    };
+
+    /**
+     * Discard cards and unset owner
+     */
+    self.cleanCards = function (cards) {
+        _.each(cards.getCards(), _.bind(function (card) {
+            delete card.owner;
+            delete card.votes;
+            self.discards.answer.addCard(card);
+            cards.removeCard(card);
+        }, this));
+        return cards;
     };
 
     /**
@@ -264,31 +482,46 @@ var Game = function Game(channel, client, config, cmdArgs) {
         self.discards.question.addCard(self.table.question);
         self.table.question = null;
 //        var count = self.table.answer.length;
-        _.each(self.table.answer, function (cards) {
-            _.each(cards.getCards(), function (card) {
-                card.owner = null;
-                self.discards.answer.addCard(card);
-                cards.removeCard(card);
-            }, this);
-        }, this);
+        _.each(self.table.answer, _.bind(function (cards) {
+            self.cleanCards(cards);
+        }, this));
         self.table.answer = [];
 
         // reset players
-        var removedNicks = [];
+        var removed = [];
         _.each(self.players, function (player) {
             player.hasPlayed = false;
+            player.voted = false;
             player.isCzar = false;
-            // check inactive count & remove after 3
-            if (player.inactiveRounds >= 3) {
-                self.removePlayer(player, {silent: true});
-                removedNicks.push(player.nick);
+            delete player.picked;
+            // check inactive count & remove after threshold
+            if (player.inactiveRounds >= config.maxIdleRounds) {
+                removed.push(player);
             }
         });
-        if (removedNicks.length > 0) {
-            self.say('Removed inactive players: ' + removedNicks.join(', '));
+        if (removed.length > 0) {
+            self.say(util.format('Removed inactive players: %s', _.map(removed, 'nick').join(', ')));
+            self.removePlayers(removed, {silent: true});
         }
-        // reset state
-        self.state = STATES.STARTED;
+        if (self.players.length) {
+            self.state = STATES.WAITING;
+            self.nextRound();
+        }
+    };
+
+    /**
+     * Draw cards for players
+     */
+    self.drawCards = function(draw) {
+        draw = draw || self.table.question.draw;
+        _.each(_.filter(self.players, {isCzar: false}), function (player) {
+            for (var i = 0; i < draw; i++) {
+                self.checkDecks();
+                var card = self.decks.answer.pickCards();
+                player.cards.addCard(card);
+                card.owner = player;
+            }
+        });
     };
 
     /**
@@ -296,111 +529,111 @@ var Game = function Game(channel, client, config, cmdArgs) {
      */
     self.playQuestion = function () {
         self.checkDecks();
+        self.state = STATES.PLAYABLE;
+
         var card = self.decks.question.pickCards();
         // replace all instance of %s with underscores for prettier output
-        var value = card.value.replace(/\%s/g, '___');
+        var value = card.displayText;
         // check if special pick & draw rules
-        if (card.pick > 1) {
-            value += c.bold(' [PICK ' + card.pick + ']');
-        }
-        if (card.draw > 0) {
-            value += c.bold(' [DRAW ' + card.draw + ']');
-        }
-        self.say(c.bold('CARD: ') + value);
+        if (card.pick > 1)
+            value += c.bold(util.format(' [PICK %s]', card.pick));
+/*
+        if (card.draw > 0)
+            value += c.bold(util.format(' [DRAW %s]', card.draw));
+*/
+
+        self.say(util.format('%s %s', c.bold('CARD:'), value));
         self.table.question = card;
-        // draw cards
-        if (self.table.question.draw > 0) {
-            _.each(_.where(self.players, {isCzar: false}), function (player) {
-                for (var i = 0; i < self.table.question.draw; i++) {
-                    self.checkDecks();
-                    var c = self.decks.answer.pickCards();
-                    player.cards.addCard(c);
-                    c.owner = player;
-                }
-            });
-        }
-        // start turn timer, check every 10 secs
-        clearInterval(self.turnTimer);
+        self.drawCards();
+
         self.roundStarted = new Date();
-        self.turnTimer = setInterval(self.turnTimerCheck, 10 * 1000);
+        self.startRoundTimers();
     };
 
     /**
      * Play a answer card from players hand
      * @param cards card indexes in players hand
      * @param player Player who played the cards
+     * @param fastPick whether this was a fastpick play
      */
-    self.playCard = function (cards, player) {
-        // don't allow if game is paused
-        if (self.state === STATES.PAUSED) {
-            self.say('Game is currently paused.');
+    self.playCard = function (cards, player, fastPick) {
+        cards = _.uniq(cards);
+
+        if (self.isPaused())
+            return (fastPick) ? false : 'Game is currently paused.';
+
+        if (typeof player === 'undefined') {
+            bot.warn('Invalid player tried to play a card');
+            return util.format('You are not in the game. Do %sjoin to play.', p);
+        }
+
+        if (self.state !== STATES.PLAYABLE || player.cards.numCards() === 0)
+            return (fastPick) ? false : 'Can\'t play at the moment.';
+
+        if (player.isCzar)
+            return 'You are the Card Czar. The Czar does not play. The Czar makes other people do their dirty work.';
+
+        if (cards.length != self.table.question.pick) {
+            // invalid card count
+            var multi = (self.table.question.pick > 1) ? 'different cards' : 'card';
+            return util.format('You must pick %s %s.', self.table.question.pick, multi);
+        }
+        if (player.picked) {
+            self.notice(player.nick, 'Changing your pick...');
+            self.table.answer = _.without(self.table.answer, player.picked.cards);
+
+            // we need to re-add the cards in sorted order or they will mess up the array length
+            _.each(player.picked.cards.getCards(), function(card, index) {
+                card.pickedIndex = player.picked.indexes[index]; // add the picked index for sorting
+            });
+            player.picked.cards.cards = _.sortBy(player.picked.cards.cards, 'pickedIndex'); // sort
+            _.each(player.picked.cards.getCards(), function(card, index) {
+                player.cards.cards.splice(card.pickedIndex, 0, card); // re-add cards in sorted order
+                delete card.pickedIndex; // sorting done, clean up the card
+            });
+        }
+        var picked;
+        try {
+            picked = {
+                indexes: cards,
+                cards: player.cards.pickCards(cards)
+            };
+        } catch (error) {
+            self.notice(player.nick, 'Invalid card index');
             return false;
         }
+        self.table.answer.push(picked.cards);
+        player.hasPlayed = true;
+        player.inactiveRounds = 0;
+        player.picked = picked;
+        self.notice(player.nick, util.format(
+            'You played: %s',
+            self.getFullEntry(self.table.question, picked.cards.getCards())
+        ));
+        // show entries if all players have played
+        if (self.checkAllPlayed() && !self.coolOff)
+            self.coolOffPeriod(self.showEntries);
 
-        console.log(player.nick + ' played cards', cards.join(', '));
-        // make sure different cards are played
-        cards = _.uniq(cards);
-        if (self.state !== STATES.PLAYABLE || player.cards.numCards() === 0) {
-            self.say(player.nick + ': Can\'t play at the moment.');
-        } else if (typeof player !== 'undefined') {
-            if (player.isCzar === true) {
-                self.say(player.nick + ': You are the card czar. The czar does not play. The czar makes other people do his dirty work.');
-            } else {
-                if (player.hasPlayed === true) {
-                    self.say(player.nick + ': You have already played on this round.');
-                } else if (cards.length != self.table.question.pick) {
-                    // invalid card count
-                    self.say(player.nick + ': You must pick ' + self.table.question.pick + ' different cards.');
-                } else {
-                    // get played cards
-                    var playerCards;
-                    try {
-                        playerCards = player.cards.pickCards(cards);
-                    } catch (error) {
-                        self.notice(player.nick, 'Invalid card index');
-                        return false;
-                    }
-                    self.table.answer.push(playerCards);
-                    player.hasPlayed = true;
-                    player.inactiveRounds = 0;
-                    self.notice(player.nick, 'You played: ' + self.getFullEntry(self.table.question, playerCards.getCards()));
-                    // show entries if all players have played
-                    if (self.checkAllPlayed()) {
-                        self.showEntries();
-                    }
-                }
-            }
-        } else {
-            console.warn('Invalid player tried to play a card');
-        }
+        return true;
     };
 
-    /**
-     * Check the time that has elapsed since the beinning of the turn.
-     * End the turn is time limit is up
-     */
-    self.turnTimerCheck = function () {
-        // check the time
-        var now = new Date();
-        var timeLimit = 3 * 60 * 1000;
-        var roundElapsed = (now.getTime() - self.roundStarted.getTime());
-        console.log('Round elapsed:', roundElapsed, now.getTime(), self.roundStarted.getTime());
-        if (roundElapsed >= timeLimit) {
-            console.log('The round timed out');
-            self.say('Time is up!');
-            self.markInactivePlayers();
-            // show end of turn
-            self.showEntries();
-        } else if (roundElapsed >= timeLimit - (10 * 1000) && roundElapsed < timeLimit) {
-            // 10s ... 0s left
-            self.say('10 seconds left!');
-        } else if (roundElapsed >= timeLimit - (30 * 1000) && roundElapsed < timeLimit - (20 * 1000)) {
-            // 30s ... 20s left
-            self.say('30 seconds left!');
-        } else if (roundElapsed >= timeLimit - (60 * 1000) && roundElapsed < timeLimit - (50 * 1000)) {
-            // 60s ... 50s left
-            self.say('Hurry up, 1 minute left!');
-            self.showStatus();
+    self.coolOffPeriod = function(callback) {
+        self.stopRoundTimers();
+        self.timers.cooloff = setTimeout(function() {
+            self.coolOff = false;
+            callback();
+        }, config.coolOffPeriod * 1000);
+
+        if (config.coolOffPeriod > 0) {
+            self.coolOff = true;
+
+            var message = '%sYou now have %s seconds to change your %s.',
+                prefix  = (self.state === self.STATES.PLAYED) ? util.format('%s: ', self.czar.nick) : '',
+                pick    = (self.noCzar) ? 'vote' : 'pick';
+
+            var lastRound = (self.lastJoinRound === 0) ? 1 : self.lastJoinRound;
+            if (self.round <= self.lastJoinRound + 1)
+                self.say(util.format(message, prefix, config.coolOffPeriod, pick));
         }
     };
 
@@ -408,70 +641,183 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * Show the entries
      */
     self.showEntries = function () {
-        // clear round timer
-        clearInterval(self.turnTimer);
-
+        self.stopRoundTimers();
         self.state = STATES.PLAYED;
-        // Check if 2 or more entries...
+
         if (self.table.answer.length === 0) {
             self.say('No one played on this round.');
-            // skip directly to next round
             self.clean();
-            self.nextRound();
-        } else if (self.table.answer.length === 1) {
+            return;
+        }
+
+        if (self.table.answer.length === 1) {
             self.say('Only one player played and is the winner by default.');
-            self.selectWinner(0);
+            self.selectWinner(0, null);
+            return;
+        }
+
+        if (self.table.answer.length === 2 && self.noCzar) {
+            self.say('There are only two entries. Both win by default.');
+            _.each(self.table.answer, function(answer) { answer.votes = 1; });
+            self.tallyVotes();
+            return;
+        }
+
+        self.say('OK! Here are the entries:');
+        // shuffle the entries
+        self.table.answer = _.shuffle(self.table.answer);
+        _.each(self.table.answer, _.bind(function (cards, i) {
+            self.say(util.format('%s: %s',
+                i, self.getFullEntry(self.table.question, cards.getCards())
+            ));
+        }, this));
+
+        var command = (config.enableFastPick) ? '' : util.format('%swinner ', p);
+
+        if (self.noCzar) {
+            self.say(util.format('Vote for the winner (/msg %s %s<entry number>)', bot.client.nick, command));
         } else {
-            self.say('Everyone has played. Here are the entries:');
-            // shuffle the entries
-            self.table.answer = _.shuffle(self.table.answer);
-            _.each(self.table.answer, function (cards, i) {
-                self.say(i + ": " + self.getFullEntry(self.table.question, cards.getCards()));
-            }, this);
             // check that czar still exists
-            var currentCzar = _.findWhere(this.players, {isCzar: true});
+            var currentCzar = _.find(self.players, {isCzar: true});
             if (typeof currentCzar === 'undefined') {
                 // no czar, random winner (TODO: Voting?)
-                self.say('The czar has fled the scene. So I will pick the winner on this round.');
+                self.say('The Card Czar has fled the scene. So I will pick the winner on this round.');
                 self.selectWinner(Math.round(Math.random() * (self.table.answer.length - 1)));
-            } else {
-                self.say(self.czar.nick + ': Select the winner (!winner <entry number>)');
-                // start turn timer, check every 10 secs
-                clearInterval(self.winnerTimer);
-                self.roundStarted = new Date();
-                self.winnerTimer = setInterval(self.winnerTimerCheck, 10 * 1000);
+                return;
             }
-
+            self.say(util.format('%s: Select the winner (%s<entry number>)', self.czar.nick, command));
         }
+        self.roundStarted = new Date();
+        self.startRoundTimers();
     };
 
     /**
-     * Check the time that has elapsed since the beinning of the winner select.
-     * End the turn is time limit is up
+     * Start countdown timers for end of round when PLAYABLE or PLAYED
+     * @param {number} elapsed     - time to subtract due to pausing
+     * @param {Object} [callbacks]
      */
-    self.winnerTimerCheck = function () {
-        // check the time
-        var now = new Date();
-        var timeLimit = 2 * 60 * 1000;
-        var roundElapsed = (now.getTime() - self.roundStarted.getTime());
-        console.log('Winner selection elapsed:', roundElapsed, now.getTime(), self.roundStarted.getTime());
-        if (roundElapsed >= timeLimit) {
-            console.log('the czar is inactive, selecting winner');
-            self.say('Time is up. I will pick the winner on this round.');
-            // Check czar & remove player after 3 timeouts
+    self.startRoundTimers = function(elapsed, callbacks) {
+        elapsed = elapsed || 0;
+
+        // callbacks can be specified for any of the four stages
+        callbacks = callbacks || {
+            Playable: {
+                warn1: function() { self.showStatus(); },
+                final: function() {
+                    self.markInactivePlayers();
+                    self.showEntries();
+                }
+            },
+            Played: {
+                warn1: function() { if (self.noCzar) self.showStatus(); },
+                final: function() {
+                    if (self.noCzar) self.tallyVotes();
+                    else             self.pickRandomWinner();
+                }
+            }
+        };
+
+        var timeLimit = (config.timeLimit * 1000) - elapsed;
+        var offsets = { warn1: 60, warn2: 30, warn3: 10, final: 0 };
+
+        // prefix warning messages with czar's nick if waiting for winner
+        var prefix = (self.state === self.STATES.PLAYED && !self.noCzar) ? util.format('%s: ', self.czar.nick) : '';
+
+        self.stopRoundTimers();
+
+        _.each(['warn1', 'warn2', 'warn3', 'final'], function(stage) {
+
+            var warning = (stage === 'final') ? util.format('%sTime is up!', prefix)
+                                              : util.format('%s%s seconds left!', prefix, offsets[stage]);
+
+            // omit timer if it would trigger (almost) immediately
+            if (3000 >= timeLimit - (offsets[stage] * 1000))
+                return;
+
+            self.timers.round[stage] = setTimeout(function() {
+                self.say(warning);
+                if (callbacks[self.state][stage])
+                    callbacks[self.state][stage]();
+            }, timeLimit - (offsets[stage] * 1000));
+
+        });
+    };
+
+    /**
+     * Stop countdown timers
+     */
+    self.stopRoundTimers = function() {
+        _.each(self.timers.round, function(timer) {
+            clearTimeout(timer);
+        });
+        self.timers.round = {};
+    };
+
+     /**
+      * Pick a random winner
+      */
+    self.pickRandomWinner = function() {
+        self.say('I will pick the winner this round.');
+
+        if (!self.noCzar)
             self.czar.inactiveRounds++;
-            // select winner
-            self.selectWinner(Math.round(Math.random() * (self.table.answer.length - 1)));
-        } else if (roundElapsed >= timeLimit - (10 * 1000) && roundElapsed < timeLimit) {
-            // 10s ... 0s left
-            self.say(self.czar.nick + ': 10 seconds left!');
-        } else if (roundElapsed >= timeLimit - (30 * 1000) && roundElapsed < timeLimit - (20 * 1000)) {
-            // 30s ... 20s left
-            self.say(self.czar.nick + ': 30 seconds left!');
-        } else if (roundElapsed >= timeLimit - (60 * 1000) && roundElapsed < timeLimit - (50 * 1000)) {
-            // 60s ... 50s left
-            self.say(self.czar.nick + ': Hurry up, 1 minute left!');
+
+        var index = Math.round(Math.random() * (self.table.answer.length - 1));
+        self.selectWinner(index, null);
+    };
+
+     /**
+      * Announce a winner of a round.
+      * Called once if by czar, possibly repeated if by tied vote.
+      * Also update the winner's owner's score.
+      * @param  {object} [winner] - Card object from table.answer, with a vote property and an owner
+      */
+     self.announceWinner = function(winner) {
+        winner = winner || self.winner;
+
+        self.state = STATES.ROUND_END;
+
+        var owner = winner.cards[0].owner;
+        owner.points++;
+        // update points object
+        var playerPoints = _.find(self.points, {player: owner});
+        if (playerPoints)
+            playerPoints.points = owner.points; // player may have quit
+
+        var votes = '';
+        if (self.noCzar && winner.votes) {
+            votes = util.format(' (with %s vote%s)',
+                        winner.votes,
+                        (winner.votes === 1) ? '' : 's'
+                    );
         }
+
+        var message = util.format(
+            'Winner: %s%s -- "%s"',
+            c.bold(owner.nick),
+            votes,
+            self.getFullEntry( self.table.question, winner.getCards() )
+        );
+        self.say(message);
+
+        if (config.revealEntryOwners) {
+            var entryOwners = [],
+                entryNick;
+
+            _.each(self.table.answer, function(entry, index) {
+                entryNick = entry.cards[0].owner.nick;
+                if (entryNick !== owner.nick)
+                    entryOwners.push(util.format('%s - %s', index, entryNick));
+            });
+            message = util.format('Who played what: %s', entryOwners.join(', '));
+            self.say(message);
+        }
+    };
+
+    self.finishRound = function() {
+        self.announceWinner();
+        self.updateLastWinner();
+        self.clean();
     };
 
     /**
@@ -479,34 +825,121 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * @param index Index of the winning card in table list
      * @param player Player who said the command (use null for internal calls, to ignore checking)
      */
-    self.selectWinner = function (index, player) {
-        // don't allow if game is paused
-        if (self.state === STATES.PAUSED) {
-            self.say('Game is currently paused.');
-            return false;
+    self.selectWinner = function (index, player, fastPick) {
+        if (self.isPaused()) {
+            return 'Game is currently paused.';
         }
 
-        // clear winner timer
-        clearInterval(self.winnerTimer);
+        if (self.state !== STATES.PLAYED)
+            return false;
 
         var winner = self.table.answer[index];
-        if (self.state === STATES.PLAYED) {
-            if (typeof player !== 'undefined' && player !== self.czar) {
-                client.say(player.nick + ': You are not the card czar. Only the card czar can select the winner');
-            } else if (typeof winner === 'undefined') {
-                self.say('Invalid winner');
-            } else {
-                self.state = STATES.ROUND_END;
-                var owner = winner.cards[0].owner;
-                owner.points++;
-                // update points object
-                _.findWhere(self.points, {player: owner}).points = owner.points;
-                // announce winner
-                self.say(c.bold('Winner is: ') + owner.nick + ' with "' + self.getFullEntry(self.table.question, winner.getCards()) + '" and gets one awesome point! ' + owner.nick + ' has ' + owner.points + ' awesome points.');
-                self.clean();
-                self.nextRound();
-            }
+
+        if (!winner)
+            return 'Invalid winner.';
+
+        if (self.noCzar && player) { // continue if voting timer ended without a vote (and called this without player arg)
+            self.voteWinner(index, winner, player, fastPick);
+            return;
         }
+
+        if (player && player !== self.czar) {
+            if (fastPick)
+                return false;
+            return 'You are not the Card Czar. Only the Card Czar can select the winner.';
+        }
+
+        if (!self.noCzar)
+            self.stopRoundTimers();
+
+        self.winner = winner;
+
+        if (!player)
+            self.finishRound();
+        else if (!self.coolOff)
+            self.coolOffPeriod(self.finishRound);
+    };
+
+    /**
+     * Select winners from voting
+     */
+    self.tallyVotes = function() {
+        self.stopRoundTimers();
+
+        var winners = utilities.multipleMax(self.table.answer, 'votes');
+        if (winners.length > 1) {
+            if (!winners[0].votes) {
+                self.say('Nobody voted.');
+                self.pickRandomWinner();
+                return;
+            }
+            self.say('We have a tie!');
+        }
+        _.each(winners, self.announceWinner);
+
+        self.clean();
+    };
+
+    /**
+     * Vote for winner
+     */
+    self.voteWinner = function(index, winner, player, fastPick) {
+        var owner = winner.cards[0].owner;
+        if (owner == player) {
+            self.notice(player.nick, 'You can\'t vote for your own entry!');
+            return false;
+        }
+        if (player.voted !== false) {
+            if (player.voted == index) {
+                self.notice(player.nick, 'You have already voted for that entry.');
+                return false;
+            }
+            var oldVote = self.table.answer[player.voted];
+            oldVote.votes--;
+            self.notice(player.nick, 'Changing your vote...');
+        }
+        winner.votes = winner.votes || 0;
+        winner.votes++;
+        player.voted = index;
+
+        self.notice(player.nick, util.format('You voted for: "%s"',
+            self.getFullEntry( self.table.question, winner.getCards() )
+        ));
+
+        if (self.checkAllVoted() && !self.coolOff)
+            self.coolOffPeriod(self.tallyVotes);
+    };
+
+    /**
+     * Store streak info for last round winner.
+     * @param {Object} [player]
+     */
+    self.updateLastWinner = function(player) {
+        if (!player && !_.isEmpty(self.winner))
+            player = self.winner.cards[0].owner;
+
+        var message, uhost = utilities.getUhost(player);
+        if ( _.isEmpty(self.lastWinner) || self.lastWinner.uhost !== uhost ) {
+            self.lastWinner = {uhost: uhost, count: 1};
+            return;
+        }
+        self.lastWinner.count++;
+        switch (self.lastWinner.count) {
+            case 2:
+                message = _.template('Two in a row! Go <%= nick %>');
+                break;
+            case 3:
+                message = _.template('That\'s three! <%= nick %>\'s on a roll.');
+                break;
+            case 4:
+                message = _.template('Four in a row??? Who can stop this mad person?');
+                break;
+            case 5:
+                message = _.template('<%= nick %>, I\'m speaking as a friend. It\'s not healthy to be this good at CAH.');
+                break;
+        }
+        if (message)
+            self.say(c.bold(message({nick: player.nick})));
     };
 
     /**
@@ -516,11 +949,20 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * @returns {*|Object|ServerResponse}
      */
     self.getFullEntry = function (question, answers) {
-        var args = [question.value];
-        _.each(answers, function (card) {
-            args.push(card.value);
-        }, this);
-        return util.format.apply(this, args);
+        var args = [];
+        _.each(answers, _.bind(function (card, index) {
+            var text = card.text;
+            if (
+                ( index === 0 && question.text[index] === '' ) || // if at the start
+                question.text[index].match(/[!?"':] $/) ||        // or after certain punctuation
+                question.text[index].match(/((?![\.]).)\. $/)     // after '. ' but not '.. '
+            )
+                text = card.displayText; // get capitalized version
+
+            args.push(c.bold(text));
+
+        }, this));
+        return util.format.apply(null, [ question.text.join('%s') ].concat(args));
     };
 
     /**
@@ -528,11 +970,15 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * @returns Boolean true if all players have played
      */
     self.checkAllPlayed = function () {
-        var allPlayed = false;
-        if (self.getNotPlayed().length === 0) {
-            allPlayed = true;
-        }
-        return allPlayed;
+        return (self.getNotPlayed().length === 0);
+    };
+
+    /**
+     * Check if all active players voted on the current round
+     * @returns Boolean true if all players have voted
+     */
+    self.checkAllVoted = function () {
+        return (self.getNotVoted().length === 0);
     };
 
     /**
@@ -541,13 +987,13 @@ var Game = function Game(channel, client, config, cmdArgs) {
     self.checkDecks = function () {
         // check answer deck
         if (self.decks.answer.numCards() === 0) {
-            console.log('answer deck is empty. reset from discard.');
+            bot.log('answer deck is empty. reset from discard.');
             self.decks.answer.reset(self.discards.answer.reset());
             self.decks.answer.shuffle();
         }
         // check question deck
         if (self.decks.question.numCards() === 0) {
-            console.log('question deck is empty. reset from discard.');
+            bot.log('question deck is empty. reset from discard.');
             self.decks.question.reset(self.discards.question.reset());
             self.decks.question.shuffle();
         }
@@ -559,34 +1005,68 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * @returns The new player or false if invalid player
      */
     self.addPlayer = function (player) {
-        if (typeof self.getPlayer({user: player.user, hostname: player.hostname}) === 'undefined') {
-            self.players.push(player);
-            self.say(player.nick + ' has joined the game');
-            // check if player is returning to game
-            var pointsPlayer = _.findWhere(self.points, {user: player.user, hostname: player.hostname});
-            if (typeof pointsPlayer === 'undefined') {
-                // new player
-                self.points.push({
-                    user:     player.user, // user and hostname are used for matching returning players
-                    hostname: player.hostname,
-                    player:   player, // reference to player object saved to points object as well
-                    points:   0
-                });
-            } else {
-                // returning player
-                pointsPlayer.player = player;
-                player.points = pointsPlayer.points;
-            }
-            // check if waiting for players
-            if (self.state === STATES.WAITING && self.players.length >= 3) {
-                // enough players, start the game
-                self.nextRound();
-            }
-            return player;
-        } else {
-            console.log('Player tried to join again', player.nick, player.user, player.hostname);
+        if (_.includes(self.removed, utilities.getUhost(player)))
+            return false;
+
+        if (typeof self.getPlayer({user: player.user, hostname: player.hostname}) !== 'undefined') {
+            bot.log('Player tried to join again', player.nick, player.user, player.hostname);
+            return false;
         }
-        return false;
+
+        var returningPlayer = _.find(self.left, {user: player.user, hostname: player.hostname});
+        var pointsPlayer =    _.find(self.points, {user: player.user, hostname: player.hostname});
+
+        if (returningPlayer) {
+            player = returningPlayer;
+            player.isCzar = (
+                player === self.czar &&
+                player.roundLeft === self.round &&
+                _.includes([ self.STATES.PLAYABLE, self.STATES.PLAYED ], self.state)
+            );
+            player.hasPlayed = (player.hasPlayed && player.roundLeft === self.round);
+            player.inactiveRounds = 0;
+            pointsPlayer.player = player;
+            player.points = pointsPlayer.points;
+            player.roundJoined = self.round;
+            delete player.roundLeft;
+            self.left = _.without(self.left, returningPlayer);
+            if (!player.isCzar)
+                self.showCards(player);
+        } else {
+            // new player
+            self.lastJoinRound = self.round;
+            player.roundJoined = self.round;
+            self.points.push({
+                user:     player.user, // user and hostname are used for matching returning players
+                hostname: player.hostname,
+                player:   player, // reference to player object saved to points object as well
+                points:   0
+            });
+        }
+
+        self.players.push(player);
+
+        self.say(util.format('%s has %sjoined the game.', player.nick, (returningPlayer) ? 're' : ''));
+
+        var minPlayers = (self.round === 0) ? config.minPlayers : 3;
+        var needed = (minPlayers - self.players.length);
+        if ( needed > 0 &&
+             ( self.round > 0 ||  _.now() > self.startTime.getTime() + 30 * 1000 )
+        ) {
+            self.say(util.format('Need %s more player%s', needed, (needed == 1 ? '' : 's')));
+        }
+        // check if waiting for players
+        if (self.state === STATES.WAITING && needed <= 0) {
+            // enough players, start the game
+            self.nextRound();
+        } else if (config.waitFromLastJoin) {
+            clearTimeout(self.timers.stop);
+            self.timers.stop = setTimeout(self.stop, config.timeWaitForPlayers * 1000);
+        }
+        if (self.config.voicePlayers === true) {
+            self.client.setChanMode(channel, '+v', player.nick);
+        }
+        return player;
     };
 
     /**
@@ -595,7 +1075,7 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * @returns {*}
      */
     self.getPlayer = function (search) {
-        return _.findWhere(self.players, search);
+        return _.find(self.players, search);
     };
 
     /**
@@ -604,58 +1084,91 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * @param options Extra options
      * @returns The removed player or false if invalid player
      */
-    self.removePlayer = function (player, options) {
+    self.removePlayers = function (players, options) {
         options = _.extend({}, options);
-        if (typeof player !== 'undefined') {
-            console.log('removing' + player.nick + ' from the game');
-            // get cards in hand
-            var cards = player.cards.reset();
-            // remove player
-            self.players = _.without(self.players, player);
-            // put player's cards to discard
-            _.each(cards, function (card) {
-                console.log('Add card ', card.text, 'to discard');
-                self.discards.answer.addCard(card);
-            });
-            if (options.silent !== true) {
-                self.say(player.nick + ' has left the game');
+        if (!players)
+            return false;
+        if (!_.isArray(players))
+            players = [ players ];
+
+        // remove players
+        _.pullAll(self.players, players);
+
+        _.each(players, function(player) {
+            if ( _.includes(self.removed, utilities.getUhost(player)) && self.round > 0 ) {
+                // player was manually kicked and can't rejoin - put player's cards to discard
+                var cards = player.cards.reset();
+                _.each(cards, function (card) {
+                    self.discards.answer.addCard(card);
+                });
+            } else { // store the player's cards in case they rejoin
+                player.roundLeft = self.round;
+                self.left.push(player);
             }
 
-            // check if remaining players have all player
-            if (self.state === STATES.PLAYABLE && self.checkAllPlayed()) {
-                self.showEntries();
-            }
+            if (!options.silent)
+                self.say(util.format('%s has left the game', player.nick));
+        });
 
-            // check czar
-            if (self.state === STATES.PLAYED && self.czar === player) {
-                self.say('The czar has fled the scene. So I will pick the winner on this round.');
-                self.selectWinner(Math.round(Math.random() * (self.table.answer.length - 1)));
-            }
 
-            return player;
+        if (self.config.voicePlayers === true && !options.left)
+            self.client.setChanMode(channel, '-v', _.map(players, 'nick'));
+
+        // check if remaining players have all played
+        if (self.state === STATES.PLAYABLE && self.checkAllPlayed() && !self.coolOff)
+            self.coolOffPeriod(self.showEntries);
+
+        // check czar
+        if (self.state === STATES.PLAYED && _.includes(players, self.czar)) {
+            if (self.timers.cooloff) {
+                clearTimeout(self.timers.cooloff);
+                self.finishRound();
+            } else {
+                self.say('The Card Czar has fled the scene.');
+                self.pickRandomWinner();
+            }
         }
-        return false;
+
+        if (self.players.length === 0 && config.stopOnLastPlayerLeave === true) {
+            clearTimeout(self.timers.stop);
+            self.stop();
+        }
+
+        return players;
     };
 
     /**
      * Get all player who have not played
-     * @returns Array list of Players that have not played
+     * @returns {object[]} list of Players that have not played
      */
     self.getNotPlayed = function () {
-        return _.where(_.filter(self.players, function (player) {
+        return _.filter(self.players, function (player) {
             // check only players with cards (so players who joined in the middle of a round are ignored)
-            return player.cards.numCards() > 0;
-        }), {hasPlayed: false, isCzar: false});
+            return player.cards.numCards() > 0 &&
+                   !player.hasPlayed && !player.isCzar;
+        });
+    };
+
+    /**
+     * Get all player who have not played
+     * @returns {object[]} list of Players that have not played
+     */
+    self.getNotVoted = function () {
+        return _.filter(self.players, function (player) {
+            // check only players with cards (so players who joined in the middle of a round are ignored)
+            return player.cards.numCards() > 0 &&
+                   player.voted === false;
+        });
     };
 
     /**
      * Check for inactive players
-     * @param options
      */
-    self.markInactivePlayers = function (options) {
-        _.each(self.getNotPlayed(), function (player) {
-            player.inactiveRounds++;
-        }, this);
+    self.markInactivePlayers = function () {
+        _.each(self.getNotPlayed(), _.bind(function (player) {
+            if (player.roundJoined !== self.round)
+                player.inactiveRounds++;
+        }, this));
     };
 
     /**
@@ -663,155 +1176,276 @@ var Game = function Game(channel, client, config, cmdArgs) {
      * @param player
      */
     self.showCards = function (player) {
-        if (typeof player !== 'undefined') {
-            var cards = "";
-            _.each(player.cards.getCards(), function (card, index) {
-                cards += c.bold(' [' + index + '] ') + card.value;
-            }, this);
-            self.notice(player.nick, 'Your cards are:' + cards);
+        if (typeof player === 'undefined')
+            return false;
+        var cards = player.cards.getCards(),
+            remainingCards = [],
+            currentCard,
+            message = 'Your cards are:',
+            newMessage;
+        _.each(cards, _.bind(function (card, index) {
+             remainingCards.push(c.bold(util.format(' [%s] ', index)) + card.displayText);
+        }, this));
+        // split output if longer than allowed message length
+        while (remainingCards.length) {
+            currentCard = remainingCards.shift();
+            newMessage = message + currentCard;
+            if (newMessage.length > (self.client.opt.messageSplit - 4)) {
+                self.notice(player.nick, util.format('%s ...', message));
+                message = currentCard;
+            } else {
+                message = newMessage;
+            }
         }
+        self.notice(player.nick, message);
     };
 
     /**
      * Show points for all players
      */
-    self.showPoints = function () {
+    self.showPoints = function (stage) {
         var sortedPlayers = _.sortBy(self.points, function (point) {
             return -point.player.points;
         });
         var output = "";
         _.each(sortedPlayers, function (point) {
-            output += point.player.nick + " " + point.points + " awesome points, ";
+            if (self.getPlayer({nick: point.player.nick}))
+                output += util.format('%s: %s, ', c.bold(point.player.nick), c.bold(point.points));
         });
-        self.say('The most horrible people: ' + output.slice(0, -2));
+        output = output.slice(0, -2);
+
+        switch (stage) {
+
+            case 'round':
+                if (self.players.length)
+                    self.say(util.format('Current scores: %s', output));
+
+                if (self.pointLimit > 0)
+                    self.say(util.format('Needed to win: %s', c.bold(self.pointLimit)));
+                break;
+
+            case 'start':
+                if (self.pointLimit > 0)
+                    self.say(util.format('Needed to win: %s', c.bold(self.pointLimit)));
+                break;
+
+            default:
+                if (self.players.length)
+                    self.say(util.format('The most horrible people: %s', output));
+        }
     };
 
     /**
      * Show status
      */
     self.showStatus = function () {
-        var playersNeeded = Math.max(0, 3 - self.players.length), // amount of player needed to start the game
-            timeLeft = 30 - Math.round((new Date().getTime() - self.startTime.getTime()) / 1000), // time left until first round
-            activePlayers = _.filter(self.players, function (player) {
-                // only players with cards in hand are active
-                return player.cards.numCards() > 0;
-            }),
-            played = _.where(activePlayers, {isCzar: false, hasPlayed: true}), // players who have already played
-            notPlayed = _.where(activePlayers, {isCzar: false, hasPlayed: false}); // players who have not played yet
+        var message,
+            playersNeeded = Math.max(0, config.minPlayers - self.players.length),
+            notPlayed = self.getNotPlayed(),
+            notVoted  = self.getNotVoted();
+
         switch (self.state) {
             case STATES.PLAYABLE:
-                self.say(c.bold('Status: ') + self.czar.nick + ' is the czar. Waiting for players to play: ' + _.pluck(notPlayed, 'nick').join(', '));
+                message = util.format('Waiting for players to play: %s', _.map(notPlayed, 'nick').join(', '));
+                if (!self.noCzar)
+                    message = util.format('%s is the Card Czar. ', self.czar.nick) + message;
                 break;
             case STATES.PLAYED:
-                self.say(c.bold('Status: ') + 'Waiting for ' + self.czar.nick + ' to select the winner.');
+                message = (self.noCzar) ? util.format('Waiting for players to vote: %s', _.map(notVoted, 'nick').join(', '))
+                                        : util.format('Waiting for %s to select the winner.', self.czar.nick);
                 break;
             case STATES.ROUND_END:
-                self.say(c.bold('Status: ') + 'Round has ended and next one is starting.');
-                break;
-            case STATES.STARTED:
-                self.say(c.bold('Status: ') + 'Game starts in ' + timeLeft + ' seconds. Need ' + playersNeeded + ' more players to start.');
+                message = 'Round has ended and next one is starting.';
                 break;
             case STATES.STOPPED:
-                self.say(c.bold('Status: ') + 'Game has been stopped.');
+                message = 'Game has been stopped.';
                 break;
             case STATES.WAITING:
-                self.say(c.bold('Status: ') + 'Not enough players to start. Need ' + playersNeeded + ' more players to start.');
+                message = util.format('Waiting for %s players to join.', playersNeeded);
                 break;
             case STATES.PAUSED:
-                self.say(c.bold('Status: ') + 'Game is paused.');
+                message = 'Game is paused.';
                 break;
         }
+        self.say(util.format('%s %s', c.bold('Status:'), message));
     };
 
     /**
-     * Set the channel topic
+     * Get all player nicks in the current game
      */
-    self.setTopic = function (topic) {
-        // ignore if not configured to set topic
-        if (typeof config.setTopic === 'undefined' || !config.setTopic) {
-            return false;
-        }
-
-        // construct new topic
-        var newTopic = topic;
-        if (typeof config.topicBase !== 'undefined') {
-            newTopic = topic + ' ' + config.topicBase;
-        }
-
-        // set it
-        client.send('TOPIC', channel, newTopic);
+    self.getPlayerNicks = function () {
+        return _.map(self.players, 'nick');
     };
 
     /**
      * List all players in the current game
      */
     self.listPlayers = function () {
-        self.say('Players currently in the game: ' + _.pluck(self.players, 'nick').join(', '));
+        return util.format('Players currently in the game: %s', self.getPlayerNicks().join(', '));
+    };
+
+    /**
+     * Handle player quits
+     * @param nick
+     */
+    self.playerQuitHandler = function (nick) {
+        self.playerLeaveHandler(nick);
+    };
+
+    /**
+     * Handle player parts
+     * @param nick
+     */
+    self.playerPartHandler = function (nick) {
+        self.playerLeaveHandler(nick);
+    };
+
+    /**
+     * Handle player kicks
+     * @param nick
+     */
+    self.playerKickHandler = function (nick) {
+        self.playerLeaveHandler(nick);
     };
 
     /**
      * Handle player quits and parts
-     * @param channel
      * @param nick
-     * @param reason
-     * @param message
      */
-    self.playerLeaveHandler = function (channel, nick, reason, message) {
-        console.log('Player ' + nick + ' left');
+    self.playerLeaveHandler = function (nick) {
         var player = self.getPlayer({nick: nick});
-        if (typeof player !== 'undefined') {
-            self.removePlayer(player);
-        }
+        if (typeof player !== 'undefined')
+            self.removePlayers(player, {left: true});
     };
 
     /**
      * Handle player nick changes
      * @param oldnick
      * @param newnick
-     * @param channels
-     * @param message
      */
-    self.playerNickChangeHandler = function (oldnick, newnick, channels, message) {
-        console.log('Player changed nick from ' + oldnick + ' to ' + newnick);
+    self.playerNickChangeHandler = function (oldnick, newnick) {
         var player = self.getPlayer({nick: oldnick});
-        if (typeof player !== 'undefined') {
+        if (typeof player !== 'undefined')
             player.nick = newnick;
+    };
+
+    /**
+     * Pause game if leaving a channel
+     */
+    self.channelLeaveHandler = function() {
+        if (self.isRunning()) {
+            bot.warn(util.format('Left channel %s while game in progress. Pausing...', channel));
+            self.pause();
         }
+    };
+
+    /**
+     * On rejoining a channel with an active game
+     */
+    self.channelRejoinHandler = function() {
+        if (self.isPaused()) {
+            bot.log(util.format('Rejoined %s where game is paused.', channel));
+            self.say(util.format('Card bot is back! Type %sresume to continue the current game.', p));
+            return true;
+        }
+        if (self.isRunning()) {
+            bot.warn(util.format('Error: Joined %s while game in progress', channel));
+            self.say('Error: Joined while game in progress. Pausing...');
+            self.pause();
+            return false;
+        }
+        bot.warn(util.format('Error: Joined %s while game in state: %s', channel, self.state));
+        return false;
+    };
+
+    /**
+     * Manage IRC client event listeners
+     */
+    self.toggleListeners = function(listeners) {
+        var onoff    = (typeof listeners !== 'undefined');
+        var func     = (onoff) ? client.addListener : client.removeListener;
+        listeners    = (onoff) ? listeners : self.listeners;
+
+        _.each(listeners, function(listener) {
+            func.apply(bot.client, listener);
+        });
+        self.listeners = (onoff) ? listeners : [];
     };
 
     /**
      * Notify users in channel that game has started
      */
     self.notifyUsers = function() {
-        // request names
-        client.send('NAMES', channel);
-
-        // signal handler to send notifications
-        self.notifyUsersPending = true;
+        var withoutModes = ['o', 'v'];
+        _.each(_(client.nicksInChannel(channel, withoutModes))
+            .difference(self.getPlayerNicks())
+            .without(client.nick)
+            .value(), function(nick) {
+                self.notice(nick, util.format(
+                    '%s: A new game of Cards Against Humanity just began in %s. ' +
+                    'Head over and %sjoin if you\'d like to get in on the fun!',
+                    nick, channel, p
+                ));
+            }
+        );
     };
 
     /**
-     * Handle names response to notify users
-     * @param nicks
+     * Set the channel topic
+     * @param addTopic
+     * @param data
      */
-    self.notifyUsersHandler = function(nicks) {
-        // ignore if we haven't requested this
-        if (self.notifyUsersPending === false) {
-            return false;
+    self.setTopic = function (addTopic, data) {
+        var format, i, newTopic;
+
+        if (typeof addTopic !== "string") {
+            format = addTopic[1];
+            addTopic = addTopic[0];
         }
-
-        // don't message nicks with these modes
-        var exemptModes = ['~', '&'];
-
-        // loop through and send messages
-        _.each(nicks, function(mode, nick) {
-            if (_.indexOf(exemptModes, mode) < 0 && nick !== config.nick) {
-                self.notice(nick, nick + ': A new game of Cards Against Humanity just began in ' + channel + '. Head over and !join if you\'d like to get in on the fun!');
+        if (addTopic === "")
+            return false;
+        if (data)
+            addTopic = _.template(addTopic)(data); // render template
+        addTopic = addTopic.split('%%').join(p); // replace command prefix
+        if (format) {
+            var cformat = c;
+            var doFormat = _.every(format.split('.'), function(f) {
+                if (typeof cformat[f] !== 'function') {
+                    bot.log(util.format('Invalid format: %s', format));
+                    return false;
+                }
+                cformat = cformat[f];
+                return true;
+            });
+            if (doFormat)
+                addTopic = cformat(addTopic);
+        }
+        var sep = config.topic.separator;
+        var topic = client.chanData(channel).topic || '';
+        if (sep) {
+            keep  = topic;
+            switch (config.topic.position) {
+                case 'left': // prepend the new topic item
+                    i = topic.indexOf(sep);
+                    if (i > -1)
+                        keep = topic.slice(i + 1);
+                    else
+                        sep += ' ';
+                    newTopic = [addTopic, keep].join(' ' + sep);
+                    break;
+                case 'right': // append the new topic item
+                    i = topic.lastIndexOf(sep);
+                    if (i > -1)
+                        keep = topic.slice(0, i);
+                    else
+                        sep = ' ' + sep;
+                    newTopic = [keep, addTopic].join(sep + ' ');
+                    break;
             }
-        });
-
-        // reset
-        self.notifyUsersPending = false;
+        } else
+            newTopic = addTopic;
+        if (newTopic !== topic)
+            client.send('TOPIC', channel, newTopic);
     };
 
     /**
@@ -830,26 +1464,47 @@ var Game = function Game(channel, client, config, cmdArgs) {
         self.client.notice(nick, string);
     };
 
-    // set topic
-    self.setTopic(c.bold.lime('A game is running. Type !join to get in on it!'));
+    self.announceWinMode = function() {
+        var message = (self.noCzar) ? 'There is no Card Czar in this game. Winners are by vote. (%scstart for a game with czar)'
+                                    : 'There is a Card Czar in this game. (%svstart for a voting game without czar)';
+        self.say(util.format(message, p));
+    };
 
     // announce the game on the channel
-    self.say('A new game of ' + c.rainbow('Cards Against Humanity') + '. The game starts in 30 seconds. Type !join to join the game any time.');
+    self.announce = function() {
+        var title = 'Cards Against Humanity';
+        title = (self.isChristmas()) ? c.christmas(title)
+                                     : c.rainbow(title);
+        self.say(util.format('%s is starting! Type %sjoin to join the game any time. (%s players needed)', title, p, config.minPlayers));
+        self.announceWinMode();
 
-    // notify users
-    if (typeof config.notifyUsers !== 'undefined' && config.notifyUsers) {
-        self.notifyUsers();
-    }
+        if (config.notifyUsers)
+            self.notifyUsers();
+    };
 
-    // wait for players to join
-    self.startTime = new Date();
-    self.startTimeout = setTimeout(self.nextRound, 30000);
+    self.isChristmas = function(now) { // pass now for testing
+        now = now || new Date();
+        return (now.getMonth() == 11 && now.getDate() > 9);
+    };
 
-    // client listeners
-    client.addListener('part', self.playerLeaveHandler);
-    client.addListener('quit', self.playerLeaveHandler);
-    client.addListener('nick', self.playerNickChangeHandler);
-    client.addListener('names'+channel, self.notifyUsersHandler);
+    c.christmas = function(str) {
+        var j, s = 0;
+        str = _.map(str, function(char, i) {
+            if (char == ' ') s++;
+            else {
+                j = (i + s);
+                char = (j % 2) ? c.green(char)
+                               : c.red(char);
+            }
+            return char;
+        });
+        str = util.format('%s%s%s', c.yellow('*'), str.join(''), c.yellow('*'));
+        return str;
+    };
+
+    if (options.init)
+        self.init();
+
 };
 
 // export static state constant

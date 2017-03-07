@@ -4,15 +4,14 @@
  * @author Teemu Lahti <teemu.lahti@gmail.com>
  * @version 0.6.0
  */
+
+var repl = require('n_');
+
 console.log('Cards Against Humanity IRC bot');
 
-// Set node env
-process.env.NODE_ENV = process.env.NODE_ENV || 'production';
+var Bot = require('./app/bot'),
+    bot = new Bot();
 
-// dependencies
-var bot = require('./app/bot');
+require('./app/repl')(repl, bot);
 
-// init the bot
-bot.init();
-// load channel command definitions
-require('./config/commands.js')(bot);
+bot.connect();

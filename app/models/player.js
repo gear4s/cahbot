@@ -1,4 +1,4 @@
-var _ = require('underscore'),
+var     _ = require('lodash'),
     Cards = require('../controllers/cards');
 
 var Player = function Player(nick, user, hostname) {
@@ -9,6 +9,7 @@ var Player = function Player(nick, user, hostname) {
     self.hostname = hostname;
     self.cards = new Cards();
     self.hasPlayed = false;
+    self.voted = false;
     self.isCzar = false;
     self.points = 0;
     self.inactiveRounds = 0;
